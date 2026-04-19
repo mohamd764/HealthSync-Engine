@@ -1,0 +1,4 @@
+renpho-api>=0.1.0
+gspread>=5.12.0
+google-auth>=2.0.0
+python-dotenv>=1.0.0
