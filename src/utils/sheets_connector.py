@@ -1,208 +1,98 @@
 """
-Google Sheets integration for Renpho Master Data.
-Reads "New Client Table" for ID mapping, writes to "Daily Record" tab.
+Tabular storage backends.
+
+Every pipeline step reads and writes named tabs through a ``SheetStore``:
+``GoogleSheetStore`` talks to a real Google Sheet (what Looker Studio reads),
+``LocalCsvStore`` writes one CSV per tab so the pipeline can run offline.
 """
 from __future__ import annotations
 
+import csv
+import logging
 import os
-from difflib import SequenceMatcher
+import re
 from typing import Any
 
-import gspread
-from google.oauth2.service_account import Credentials
+log = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+UPLOAD_BATCH_ROWS = 4000
+
+Rows = list[list[Any]]
 
 
-def _get_client(credentials_path: str) -> gspread.Client:
-    creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
-    return gspread.authorize(creds)
+class SheetStore:
+    def read(self, tab: str) -> list[list[str]]:
+        """Return all rows of ``tab`` (header first), or ``[]`` if the tab does not exist."""
+        raise NotImplementedError
+
+    def write(self, tab: str, rows: Rows) -> None:
+        """Replace the contents of ``tab`` with ``rows`` (header first), creating it if needed."""
+        raise NotImplementedError
 
 
-def _get_sheet(credentials_path: str, sheet_id: str) -> gspread.Spreadsheet:
-    return _get_client(credentials_path).open_by_key(sheet_id)
+class GoogleSheetStore(SheetStore):
+    def __init__(self, sheet_id: str, credentials_path: str):
+        self.sheet_id = sheet_id
+        self.credentials_path = credentials_path
+        self._sheet = None
 
+    def _spreadsheet(self):
+        if self._sheet is None:
+            import gspread
+            from google.oauth2.service_account import Credentials
 
-# ─── Read New Client Table ───────────────────────────────────────────────────
+            creds = Credentials.from_service_account_file(self.credentials_path, scopes=SCOPES)
+            self._sheet = gspread.authorize(creds).open_by_key(self.sheet_id)
+        return self._sheet
 
-def read_client_table(
-    sheet_id: str,
-    credentials_path: str,
-    tab_name: str = "New Client Table",
-) -> dict:
-    """
-    Read the New Client Table and return two lookup dicts:
-      app_id_map : {lowercase(App ID) -> (Client ID, Client Name)}
-      name_map   : {lowercase(Client Name) -> (Client ID, Client Name)}
-    """
-    sheet = _get_sheet(credentials_path, sheet_id)
-    ws = sheet.worksheet(tab_name)
-    rows = ws.get_all_values()
+    def read(self, tab: str) -> list[list[str]]:
+        import gspread
 
-    if not rows:
-        return {"app_id_map": {}, "name_map": {}}
-
-    # Headers: Client ID | Client Name | App ID | ...
-    app_id_map: dict[str, tuple[int, str]] = {}
-    name_map: dict[str, tuple[int, str]] = {}
-
-    for row in rows[1:]:  # skip header
-        if len(row) < 3 or not row[0].strip():
-            continue
         try:
-            client_id = int(row[0].strip())
-        except ValueError:
-            continue
-        client_name = row[1].strip()
-        app_id = row[2].strip()
+            return self._spreadsheet().worksheet(tab).get_all_values()
+        except gspread.WorksheetNotFound:
+            log.warning("Tab '%s' not found; treating it as empty", tab)
+            return []
 
-        if app_id:
-            app_id_map[app_id.lower()] = (client_id, client_name)
-        if client_name:
-            name_map[client_name.lower()] = (client_id, client_name)
+    def write(self, tab: str, rows: Rows) -> None:
+        import gspread
+        from gspread.utils import rowcol_to_a1
 
-    return {"app_id_map": app_id_map, "name_map": name_map}
-
-
-# ─── Fuzzy Matching ──────────────────────────────────────────────────────────
-
-def match_friend_to_client(
-    friend_name: str,
-    app_id_map: dict[str, tuple[int, str]],
-    name_map: dict[str, tuple[int, str]],
-    threshold: float = 0.75,
-) -> tuple[int, str] | None:
-    """
-    Match a Renpho friend name to a client in the New Client Table.
-    Priority:
-      1. Exact match on App ID (column C)
-      2. Exact match on Client Name (column B)
-      3. Fuzzy match on App ID or Client Name (≥ threshold)
-    Returns (client_id, client_name) or None if no match.
-    """
-    key = friend_name.strip().lower()
-
-    # 1. Exact on App ID
-    if key in app_id_map:
-        return app_id_map[key]
-
-    # 2. Exact on Client Name
-    if key in name_map:
-        return name_map[key]
-
-    # 3. Fuzzy match
-    best_score = 0.0
-    best_match = None
-
-    for app_id, val in app_id_map.items():
-        score = SequenceMatcher(None, key, app_id).ratio()
-        if score > best_score:
-            best_score = score
-            best_match = val
-
-    for name, val in name_map.items():
-        score = SequenceMatcher(None, key, name).ratio()
-        if score > best_score:
-            best_score = score
-            best_match = val
-
-    if best_score >= threshold:
-        return best_match
-
-    return None
+        n_rows = max(len(rows), 1) + 10
+        n_cols = max((len(r) for r in rows), default=1)
+        sheet = self._spreadsheet()
+        try:
+            ws = sheet.worksheet(tab)
+        except gspread.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=tab, rows=n_rows, cols=n_cols)
+        ws.clear()
+        ws.resize(rows=n_rows, cols=n_cols)
+        for start in range(0, len(rows), UPLOAD_BATCH_ROWS):
+            ws.update(values=rows[start:start + UPLOAD_BATCH_ROWS], range_name=f"A{start + 1}")
+        if rows:
+            ws.format(f"A1:{rowcol_to_a1(1, n_cols)}", {"textFormat": {"bold": True}})
 
 
-# ─── Export to Daily Record ──────────────────────────────────────────────────
+class LocalCsvStore(SheetStore):
+    def __init__(self, directory: str):
+        self.directory = directory
+        os.makedirs(directory, exist_ok=True)
 
-def export_to_daily_record(
-    rows: list[dict[str, Any]],
-    sheet_id: str,
-    credentials_path: str,
-    worksheet_name: str = "Daily Record",
-) -> None:
-    """
-    Export rows to the Daily Record tab.
-    Columns: Client ID | Client Name | Date (dd/mm/yy) | Value
-    """
-    sheet = _get_sheet(credentials_path, sheet_id)
+    def path_for(self, tab: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", tab.lower()).strip("_")
+        return os.path.join(self.directory, f"{slug}.csv")
 
-    try:
-        ws = sheet.worksheet(worksheet_name)
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=worksheet_name, rows=2000, cols=10)
+    def read(self, tab: str) -> list[list[str]]:
+        path = self.path_for(tab)
+        if not os.path.exists(path):
+            return []
+        with open(path, newline="", encoding="utf-8") as f:
+            return [row for row in csv.reader(f)]
 
-    headers = ["Client ID", "Client Name", "Date (dd/mm/yy)", "Value"]
-
-    data = []
-    for r in rows:
-        data.append([
-            r.get("client_id", 0),
-            r.get("client_name", "Unknown"),
-            r.get("date_recorded", ""),
-            r.get("weight_kg", ""),
-        ])
-
-    ws.clear()
-    ws.update([headers] + data, "A1")
-    ws.format("A1:D1", {"textFormat": {"bold": True}})
-
-
-# ─── Unmatched Report ────────────────────────────────────────────────────────
-
-def write_unmatched_report(
-    unmatched: list[str],
-    sheet_id: str,
-    credentials_path: str,
-    tab_name: str = "Unmatched Names",
-) -> None:
-    """Create/update an 'Unmatched Names' tab listing friend names with no match."""
-    if not unmatched:
-        return
-
-    sheet = _get_sheet(credentials_path, sheet_id)
-
-    try:
-        ws = sheet.worksheet(tab_name)
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=tab_name, rows=200, cols=3)
-
-    headers = ["Renpho Friend Name", "Status"]
-    data = [[name, "No match found"] for name in sorted(set(unmatched))]
-
-    ws.clear()
-    ws.update([headers] + data, "A1")
-    ws.format("A1:B1", {"textFormat": {"bold": True}})
-
-
-# ─── Legacy wrapper (backward compat with old main.py) ──────────────────────
-
-def export_to_sheet(
-    rows: list[dict[str, Any]],
-    sheet_id: str,
-    credentials_path: str,
-    worksheet_name: str = "Renpho Data",
-) -> None:
-    """Legacy 3-column export for the old main.py."""
-    sheet = _get_sheet(credentials_path, sheet_id)
-    try:
-        ws = sheet.worksheet(worksheet_name)
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=worksheet_name, rows=1000, cols=10)
-
-    headers = ["Client Name", "Weight (Kg)", "Date of Record"]
-    data = [[r["client_name"], r["weight_kg"], r["date_recorded"]] for r in rows]
-    ws.clear()
-    ws.update([headers] + data, "A1")
-    ws.format("A1:C1", {"textFormat": {"bold": True}})
-
-
-def export_from_env(rows: list[dict[str, Any]]) -> None:
-    """Legacy wrapper used by old main.py."""
-    sheet_id = os.getenv("GOOGLE_SHEET_ID")
-    creds_path = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
-    if not sheet_id:
-        raise ValueError("GOOGLE_SHEET_ID not set in .env")
-    export_to_sheet(rows, sheet_id, creds_path)
+    def write(self, tab: str, rows: Rows) -> None:
+        with open(self.path_for(tab), "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(["" if v is None else v for v in row] for row in rows)
