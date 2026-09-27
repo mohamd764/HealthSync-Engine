@@ -2,9 +2,9 @@
 Build Looker Studio Master - V4 (All Sources Merged)
 =====================================================
 Merges daily records from ALL 3 sources:
-  1. Trainerize Daily Logs  (88 clients, compliance + weight + waist)
-  2. Daily Record - Main     (89 clients, Renpho weight data)
-  3. Daily Record            (10 clients, older Renpho data)
+  1. Trainerize Daily Logs  (compliance + weight + waist)
+  2. Daily Record - Main     (Renpho weight data)
+  3. Daily Record            (older Renpho data)
 Ensures EVERY active client appears in Looker Studio Master,
 even those without any daily records (summary row only).
 """
@@ -16,9 +16,9 @@ from datetime import datetime
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-CRED_PATH = r"C:\Users\comp\Downloads\Trainerize_App\credentials.json"
-GOOGLE_SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
-MERGER_SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
+CRED_PATH = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+MERGER_SHEET_ID = os.getenv("MERGER_SHEET_ID", GOOGLE_SHEET_ID)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 

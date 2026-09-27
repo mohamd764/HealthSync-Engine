@@ -20,9 +20,10 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-TZ_GROUP_ID = "YOUR_TRAINERIZE_GROUP_ID"
-TZ_API_TOKEN = "YOUR_API_TOKEN_HERE"
-GOOGLE_SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
+TZ_GROUP_ID = os.getenv("TZ_GROUP_ID", "")
+TZ_API_TOKEN = os.getenv("TZ_API_TOKEN", "")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
 
 API_BASE = "https://api.trainerize.com/v03"
 HISTORY_DAYS = 90   # Body stats (per-day API calls - keep short)
@@ -207,12 +208,7 @@ def get_client_metadata():
         from google.oauth2.service_account import Credentials
         SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         
-        cred_paths = [
-            r"C:\Users\comp\Downloads\Trainerize_App\credentials.json",
-            os.path.join(SCRIPT_DIR, "credentials.json"),
-            os.getenv("GOOGLE_CREDENTIALS_JSON", ""),
-        ]
-        creds_file = next((p for p in cred_paths if p and os.path.exists(p)), None)
+        creds_file = GOOGLE_CREDENTIALS if os.path.exists(GOOGLE_CREDENTIALS) else None
         if not creds_file: return {}
 
         creds = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
@@ -280,18 +276,7 @@ def export_to_sheets(rows):
             "https://www.googleapis.com/auth/drive",
         ]
 
-        # Try multiple credential paths
-        cred_paths = [
-            r"C:\Users\comp\Downloads\Trainerize_App\credentials.json",
-            os.path.join(SCRIPT_DIR, "credentials.json"),
-            os.getenv("GOOGLE_CREDENTIALS_JSON", ""),
-        ]
-
-        creds_file = None
-        for p in cred_paths:
-            if p and os.path.exists(p):
-                creds_file = p
-                break
+        creds_file = GOOGLE_CREDENTIALS if os.path.exists(GOOGLE_CREDENTIALS) else None
 
         if not creds_file:
             print("  WARNING: No credentials.json found. Skipping Google Sheets export.")
@@ -304,60 +289,15 @@ def export_to_sheets(rows):
         rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
         sheet_data = [HEADERS] + rows
 
-        # Strategy 1: Try existing sheet first
+        sheet = gc.open_by_key(GOOGLE_SHEET_ID)
         try:
-            sheet = gc.open_by_key(GOOGLE_SHEET_ID)
-            try:
-                ws = sheet.worksheet(tab)
-            except gspread.WorksheetNotFound:
-                ws = sheet.add_worksheet(title=tab, rows=5000, cols=20)
-            ws.clear()
-            ws.update(sheet_data, "A1")
-            ws.format("A1:Q1", {"textFormat": {"bold": True}})
-            print(f"  Exported {len(rows)} rows to existing sheet -> '{tab}'")
-            return True
-        except Exception as e1:
-            print(f"  Existing sheet failed: {e1}")
-            print(f"  Creating a NEW Google Sheet...")
-
-        # Strategy 2: Create a brand new Google Sheet
-        new_sheet = gc.create("Trainerize Daily Logs - Thrive With Age")
-        ws = new_sheet.sheet1
-        ws.update_title(tab)
-        ws.resize(rows=len(rows) + 10, cols=20)
+            ws = sheet.worksheet(tab)
+        except gspread.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=tab, rows=5000, cols=20)
+        ws.clear()
         ws.update(sheet_data, "A1")
         ws.format("A1:Q1", {"textFormat": {"bold": True}})
-
-        # Share with the user and the client
-        emails_to_share = [
-            "contactYOUR_APP_NAME@gmail.com",  # Client email
-            "ashiqd@gmail.com",                # Trainer email
-        ]
-        for email in emails_to_share:
-            try:
-                new_sheet.share(email, perm_type="user", role="writer", notify=True)
-                print(f"  Shared with: {email}")
-            except Exception:
-                pass
-
-        # Also make it accessible via link
-        try:
-            new_sheet.share("", perm_type="anyone", role="reader")
-        except Exception:
-            pass
-
-        new_url = f"https://docs.google.com/spreadsheets/d/{new_sheet.id}/edit"
-        print(f"\n  ✅ NEW Google Sheet created successfully!")
-        print(f"  📎 URL: {new_url}")
-        print(f"  Exported {len(rows)} rows to '{tab}'")
-
-        # Save the new sheet URL for reference
-        with open(os.path.join(SCRIPT_DIR, "NEW_SHEET_URL.txt"), "w") as f:
-            f.write(f"New Trainerize Daily Logs Sheet\n")
-            f.write(f"URL: {new_url}\n")
-            f.write(f"Sheet ID: {new_sheet.id}\n")
-            f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
+        print(f"  Exported {len(rows)} rows to existing sheet -> '{tab}'")
         return True
 
     except Exception as e:

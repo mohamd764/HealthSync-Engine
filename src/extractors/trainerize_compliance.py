@@ -31,11 +31,11 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Trainerize API credentials
-TZ_GROUP_ID = os.getenv("TZ_GROUP_ID", "559190")
-TZ_API_TOKEN = os.getenv("TZ_API_TOKEN", "sBx8XX3BykCy4v8T1c3jQ")
+TZ_GROUP_ID = os.getenv("TZ_GROUP_ID", "")
+TZ_API_TOKEN = os.getenv("TZ_API_TOKEN", "")
 
 # Google Sheets
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "YOUR_GOOGLE_SHEET_ID_HERE")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
 
 # API settings
