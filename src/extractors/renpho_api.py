@@ -1,308 +1,219 @@
 ﻿"""
-Renpho Friends Weight Tracker â†’ Daily Record
-Fetches friend weight data from Renpho API and exports to the
-"Daily Record" tab in the client's "Renpho Master Data" Google Sheet.
+Renpho "friends" weight extractor.
 
-Endpoints discovered via MITM traffic analysis:
-  - /RenphoHealth/app/friend/friendsList  (get friends list)
-  - /RenphoHealth/app/friend/measure/trend (get weight data per friend)
+A single coach-owned Renpho account adds every client as a friend; this step reads
+each friend's weight history and writes it to the "Daily Record" tab, mapped to the
+client IDs in the "New Client Table".
+
+Renpho has no public API. Login and payload encryption come from the unofficial
+``renpho-api`` package; the two friend endpoints below are undocumented app
+endpoints and may change without notice:
+  - /RenphoHealth/app/friend/friendsList
+  - /RenphoHealth/app/friend/measure/trend
 """
+from __future__ import annotations
 
 import json
+import logging
 import os
-import sys
 from datetime import datetime
 
-os.environ["NO_PROXY"] = "*"
-os.environ["no_proxy"] = "*"
+from src.utils.client_mapping import CLIENT_TABLE_TAB, match_friend_to_client, parse_client_table
+from src.utils.sheets_connector import SheetStore
 
-from dotenv import load_dotenv
-from renpho import RenphoClient
-from renpho.crypto import encrypt_request, decrypt_response
-from sheets_export import (
-    export_to_daily_record,
-    match_friend_to_client,
-    read_client_table,
-    write_unmatched_report,
-)
+log = logging.getLogger(__name__)
 
 BASE_URL = "https://cloud.renpho.com"
+DAILY_RECORD_TAB = "Daily Record"
+UNMATCHED_TAB = "Unmatched Names"
+DAILY_RECORD_HEADERS = ["Client ID", "Client Name", "Date (dd/mm/yy)", "Value"]
+FRIENDS_PAGE_SIZE = 100
 
 
-def make_headers(client):
-    return {
-        "token": client.token,
-        "userId": str(client.user_id),
-        "appVersion": "7.6.4",
-        "platform": "android",
-        "systemVersion": "15",
-        "languageCode": "en",
-        "language": "en",
-        "area": "GB",
-        "userArea": "GB",
-        "timeZone": "+0",
-        "zoneId": "Europe/London",
-        "Content-Type": "application/json;charset=UTF-8",
-    }
+class RenphoFriendsAPI:
+    """Thin wrapper over ``renpho.RenphoClient`` exposing the two friend endpoints."""
 
+    def __init__(self, email: str, password: str):
+        from renpho import RenphoClient
 
-def api_call(session, headers, endpoint, payload):
-    url = f"{BASE_URL}/RenphoHealth/app/{endpoint}"
-    body = encrypt_request(payload)
-    resp = session.post(url, json=body, headers=headers, timeout=30)
-    rdata = resp.json()
-    if rdata.get("code") != 101:
-        return None
-    enc_data = rdata.get("data")
-    if enc_data and isinstance(enc_data, str):
-        return decrypt_response(enc_data)
-    return enc_data
+        self._client = RenphoClient(email=email, password=password)
 
+    def login(self) -> None:
+        self._client.login()
 
-def get_friends_list(client):
-    """Fetch all friends with pagination support."""
-    headers = make_headers(client)
-    all_friends = []
-    page_num = 1
-    page_size = 100
+    def _headers(self) -> dict:
+        return {
+            "token": self._client.token,
+            "userId": str(self._client.user_id),
+            "appVersion": "7.6.4",
+            "platform": "android",
+            "systemVersion": "15",
+            "languageCode": "en",
+            "language": "en",
+            "area": "GB",
+            "userArea": "GB",
+            "timeZone": "+0",
+            "zoneId": "Europe/London",
+            "Content-Type": "application/json;charset=UTF-8",
+        }
 
-    def _fetch_page(use_pagination):
-        if use_pagination:
-            p = {"userId": str(client.user_id), "pageNum": page_num, "pageSize": page_size}
-        else:
-            p = {"userId": str(client.user_id)}
-        data = api_call(client._session, headers, "friend/friendsList", p)
+    def _call(self, endpoint: str, payload: dict):
+        from renpho.crypto import decrypt_response, encrypt_request
+
+        resp = self._client._session.post(
+            f"{BASE_URL}/RenphoHealth/app/{endpoint}",
+            json=encrypt_request(payload),
+            headers=self._headers(),
+            timeout=30,
+        )
+        rdata = resp.json()
+        if rdata.get("code") != 101:
+            return None
+        enc_data = rdata.get("data")
+        if enc_data and isinstance(enc_data, str):
+            return decrypt_response(enc_data)
+        return enc_data
+
+    def _friends_page(self, page_num: int | None) -> list[dict]:
+        payload = {"userId": str(self._client.user_id)}
+        if page_num is not None:
+            payload.update(pageNum=page_num, pageSize=FRIENDS_PAGE_SIZE)
+        data = self._call("friend/friendsList", payload)
         return (data.get("list") or data.get("data") or data.get("rows") or []) if data else []
 
-    while True:
-        friends = _fetch_page(use_pagination=True)
-        if not friends and page_num == 1:
-            friends = _fetch_page(use_pagination=False)
-        if not friends:
-            break
-        all_friends.extend(friends)
-        if len(friends) < page_size:
-            break
-        page_num += 1
-        print(f"  Fetched page {page_num - 1} ({len(friends)} friends), fetching more...")
+    def list_friends(self) -> list[dict]:
+        friends: list[dict] = []
+        page_num = 1
+        while True:
+            page = self._friends_page(page_num)
+            if not page and page_num == 1:
+                page = self._friends_page(None)
+            if not page:
+                break
+            friends.extend(page)
+            if len(page) < FRIENDS_PAGE_SIZE:
+                break
+            page_num += 1
+        return friends
 
-    return all_friends
-
-
-def get_friend_weight(client, friend_user_id):
-    headers = make_headers(client)
-    payload = {
-        "rhFriendId": str(friend_user_id),
-        "timeZone": 0,
-        "param": "weight",
-        "sourceDataType": "",
-        "timeType": "ALL",
-        "pageNum": 1,
-        "pageSize": 1000,
-    }
-    return api_call(client._session, headers, "friend/measure/trend", payload)
+    def get_weight_trend(self, friend_user_id) -> object:
+        return self._call("friend/measure/trend", {
+            "rhFriendId": str(friend_user_id),
+            "timeZone": 0,
+            "param": "weight",
+            "sourceDataType": "",
+            "timeType": "ALL",
+            "pageNum": 1,
+            "pageSize": 1000,
+        })
 
 
 def convert_date(date_str: str) -> str:
-    """Convert 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD' to 'dd/mm/yy' format."""
+    """Convert 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD' to 'dd/mm/yy'; return input unchanged if unparseable."""
     if not date_str or date_str == "N/A":
         return ""
-    try:
-        # Try full datetime first
-        dt = datetime.strptime(date_str[:19], "%Y-%m-%d %H:%M:%S")
-        return dt.strftime("%d/%m/%y")
-    except ValueError:
+    for fmt, length in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
         try:
-            dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
-            return dt.strftime("%d/%m/%y")
+            return datetime.strptime(date_str[:length], fmt).strftime("%d/%m/%y")
         except ValueError:
-            return date_str
+            continue
+    return date_str
 
 
-def extract_weight_records(weight_data):
-    """Extract a list of (weight, date_str) tuples from API response."""
-    results = []
+def extract_weight_records(weight_data) -> list[tuple[str, str]]:
+    """Normalise the various trend-response shapes into ``[(weight_str, date_str), ...]``."""
     if weight_data is None:
-        return results
+        return []
 
-    if isinstance(weight_data, dict):
+    if isinstance(weight_data, list):
+        records = weight_data
+    elif isinstance(weight_data, dict):
         records = (
             weight_data.get("list")
             or weight_data.get("data")
             or weight_data.get("records")
             or weight_data.get("trendList")
             or weight_data.get("measureList")
-            or []
+            or next((v for v in weight_data.values() if isinstance(v, list) and v), None)
         )
         if not records:
-            # Try to find any list inside the dict
-            for key, val in weight_data.items():
-                if isinstance(val, list) and val:
-                    records = val
-                    break
-            if not records:
-                # Try single value
-                w = (
-                    weight_data.get("weight")
-                    or weight_data.get("bodyWeight")
-                    or weight_data.get("lastWeight")
-                    or weight_data.get("value")
-                )
-                d = (
-                    weight_data.get("measureTime")
-                    or weight_data.get("date")
-                    or weight_data.get("time")
-                    or weight_data.get("createTime")
-                )
-                if w:
-                    results.append((str(w), str(d) if d else "N/A"))
-                return results
-    elif isinstance(weight_data, list):
-        records = weight_data
+            w = (weight_data.get("weight") or weight_data.get("bodyWeight")
+                 or weight_data.get("lastWeight") or weight_data.get("value"))
+            d = (weight_data.get("measureTime") or weight_data.get("date")
+                 or weight_data.get("time") or weight_data.get("createTime"))
+            return [(str(w), str(d) if d else "N/A")] if w else []
     else:
-        return results
+        return []
 
+    results = []
     for rec in records:
         weight_val = rec.get("weight", "N/A")
         date_str = rec.get("localCreatedAt", "N/A")
-        if isinstance(weight_val, (int, float)):
-            weight_str = f"{weight_val:.2f}"
-        else:
-            weight_str = str(weight_val)
+        weight_str = f"{weight_val:.2f}" if isinstance(weight_val, (int, float)) else str(weight_val)
         results.append((weight_str, date_str[:19] if date_str else "N/A"))
-
     return results
 
 
-def main():
-    load_dotenv()
-    email = os.getenv("RENPHO_EMAIL")
-    password = os.getenv("RENPHO_PASSWORD")
-    sheet_id = os.getenv("GOOGLE_SHEET_ID")
-    creds_path = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
+def build_daily_rows(source, maps: dict) -> tuple[list[dict], list[str]]:
+    """Fetch every friend's weight history and map it to client IDs. Returns (rows, unmatched_names)."""
+    rows: list[dict] = []
+    unmatched: list[str] = []
 
-    if not email or not password:
-        print("Error: Set RENPHO_EMAIL and RENPHO_PASSWORD in .env")
-        sys.exit(1)
-    if not sheet_id:
-        print("Error: Set GOOGLE_SHEET_ID in .env")
-        sys.exit(1)
-
-    # â”€â”€ Step 1: Read Client Table for ID mapping â”€â”€
-    print("Reading 'New Client Table' for client mapping...")
-    try:
-        maps = read_client_table(sheet_id, creds_path)
-        app_id_map = maps["app_id_map"]
-        name_map = maps["name_map"]
-        print(f"  Loaded {len(app_id_map)} App IDs and {len(name_map)} Client Names.\n")
-    except Exception as e:
-        print(f"Error reading client table: {e}")
-        sys.exit(1)
-
-    # â”€â”€ Step 2: Login to Renpho â”€â”€
-    print(f"Logging in as {email}...")
-    client = RenphoClient(email=email, password=password)
-    client.login()
-    print(f"Login OK. userId={client.user_id}\n")
-
-    # â”€â”€ Step 3: Fetch friends list â”€â”€
-    print("Fetching friends list...")
-    friends = get_friends_list(client)
-    print(f"Found {len(friends)} friends.\n")
-
-    # â”€â”€ Step 4: Fetch weight data and match to clients â”€â”€
-    all_rows = []
-    unmatched_names = []
-
-    for friend in friends:
+    for friend in source.list_friends():
         renpho_name = friend.get("accountName", "Unknown")
-        friend_id = friend.get("userId", "")
-
-        # Match to client
-        match = match_friend_to_client(renpho_name, app_id_map, name_map)
+        match = match_friend_to_client(renpho_name, maps["app_id_map"], maps["name_map"])
         if match:
             client_id, client_name = match
-            print(f"  âœ“ {renpho_name} â†’ Client #{client_id} ({client_name})")
         else:
             client_id, client_name = 0, renpho_name
-            unmatched_names.append(renpho_name)
-            print(f"  âœ— {renpho_name} â†’ NO MATCH (will use placeholder ID=0)")
+            unmatched.append(renpho_name)
 
-        # Fetch weight history
         try:
-            weight_data = get_friend_weight(client, friend_id)
+            weight_data = source.get_weight_trend(friend.get("userId", ""))
         except Exception as e:
-            print(f"    Error fetching weight: {e}")
+            log.warning("Weight fetch failed for a friend: %s", e.__class__.__name__)
             weight_data = None
 
-        records = extract_weight_records(weight_data)
-
-        if records:
-            for weight_str, date_str in records:
-                all_rows.append({
-                    "client_id": client_id,
-                    "client_name": client_name,
-                    "date_recorded": convert_date(date_str),
-                    "weight_kg": weight_str,
-                })
-            print(f"    {len(records)} weight records fetched.")
-        else:
-            all_rows.append({
+        records = extract_weight_records(weight_data) or [("N/A", "")]
+        for weight_str, date_str in records:
+            rows.append({
                 "client_id": client_id,
                 "client_name": client_name,
-                "date_recorded": "",
-                "weight_kg": "N/A",
+                "date_recorded": convert_date(date_str),
+                "weight_kg": weight_str,
             })
-            print(f"    No weight data available.")
 
-    # â”€â”€ Step 5: Sort (group by client name, then date ascending) â”€â”€
-    def _sort_key(row):
-        name = (row["client_name"] or "").strip()
-        d = (row["date_recorded"] or "").strip()
-        return (name, d)
+    rows.sort(key=lambda r: ((r["client_name"] or "").strip(), _sortable_date(r["date_recorded"])))
+    return rows, unmatched
 
-    all_rows.sort(key=_sort_key)
 
-    # â”€â”€ Step 6: Print summary â”€â”€
-    print(f"\n{'=' * 70}")
-    print(f"  TOTAL ROWS TO EXPORT: {len(all_rows)}")
-    print(f"  MATCHED FRIENDS: {len(friends) - len(unmatched_names)}")
-    print(f"  UNMATCHED FRIENDS: {len(unmatched_names)}")
-    print(f"{'=' * 70}")
-    print(f"{'ID':<6} {'Client Name':<25} {'Weight':<12} {'Date':<15}")
-    print(f"{'-' * 6} {'-' * 25} {'-' * 12} {'-' * 15}")
-    for r in all_rows[:15]:
-        print(f"{r['client_id']:<6} {r['client_name']:<25} {r['weight_kg']:<12} {r['date_recorded']:<15}")
-    if len(all_rows) > 15:
-        print(f"  ... and {len(all_rows) - 15} more rows")
-    print(f"{'=' * 70}")
-
-    if unmatched_names:
-        print(f"\nUnmatched names: {', '.join(unmatched_names)}")
-
-    # â”€â”€ Step 7: Export to Google Sheet â”€â”€
-    print("\nExporting to 'Daily Record' tab...")
+def _sortable_date(ddmmyy: str) -> str:
     try:
-        export_to_daily_record(all_rows, sheet_id, creds_path)
-        print("âœ“ Data exported to 'Daily Record' successfully.")
-    except Exception as e:
-        print(f"âœ— Failed to export: {e}")
-
-    if unmatched_names:
-        print("\nWriting unmatched names report...")
-        try:
-            write_unmatched_report(unmatched_names, sheet_id, creds_path)
-            print("âœ“ Unmatched names report written.")
-        except Exception as e:
-            print(f"âœ— Failed to write unmatched report: {e}")
-
-    # â”€â”€ Step 8: Save local backup â”€â”€
-    output_file = os.path.join(os.path.dirname(__file__), "friends_weight_data.json")
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(all_rows, f, ensure_ascii=False, indent=2)
-    print(f"\nLocal backup saved: {output_file} ({len(all_rows)} rows)")
+        return datetime.strptime(ddmmyy, "%d/%m/%y").strftime("%Y-%m-%d")
+    except ValueError:
+        return ddmmyy or ""
 
 
-if __name__ == "__main__":
-    main()
+def run(source, store: SheetStore, output_dir: str) -> int:
+    maps = parse_client_table(store.read(CLIENT_TABLE_TAB))
+    log.info("Loaded %d App IDs and %d client names from '%s'",
+             len(maps["app_id_map"]), len(maps["name_map"]), CLIENT_TABLE_TAB)
 
+    log.info("Logging in to Renpho...")
+    source.login()
+    rows, unmatched = build_daily_rows(source, maps)
+    log.info("Fetched %d weight rows; %d unmatched friend(s)", len(rows), len(unmatched))
+
+    store.write(DAILY_RECORD_TAB, [DAILY_RECORD_HEADERS] + [
+        [r["client_id"], r["client_name"], r["date_recorded"], r["weight_kg"]] for r in rows
+    ])
+    if unmatched:
+        store.write(UNMATCHED_TAB, [["Renpho Friend Name", "Status"]] +
+                    [[name, "No match found"] for name in sorted(set(unmatched))])
+
+    os.makedirs(output_dir, exist_ok=True)
+    backup = os.path.join(output_dir, "friends_weight_data.json")
+    with open(backup, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+    log.info("Local backup: %s", backup)
+    return len(rows)
